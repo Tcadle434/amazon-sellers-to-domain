@@ -66,12 +66,28 @@ GOOGLE_CSE_API_KEY = "YOUR_GOOGLE_CSE_API_KEY_HERE"
 GOOGLE_CSE_CX = "YOUR_SEARCH_ENGINE_ID_HERE"
 ```
 
+## Script Versions
+
+There are two versions of the script:
+
+| Script | Search Engines | Speed | Coverage |
+|--------|---------------|-------|----------|
+| `enrich_sellers.py` | SerpAPI + Google CSE | Slower | Better coverage |
+| `enrich_sellers_lite.py` | SerpAPI only | Faster | Good coverage |
+
+The lite version only requires SerpAPI and Anthropic keys (no Google CSE setup needed). It sometimes catches results the main script misses, so you can try both and compare.
+
 ## Usage
 
 ### Basic usage
 
 ```bash
 python3 enrich_sellers.py your_file.csv
+```
+
+Or use the lite version:
+```bash
+python3 enrich_sellers_lite.py your_file.csv
 ```
 
 This will:
