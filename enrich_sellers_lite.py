@@ -355,7 +355,7 @@ def main():
             return 1
 
     # Output columns - just add the domain column
-    output_fieldnames = list(fieldnames) + ["domain from custom script"]
+    output_fieldnames = list(fieldnames) + ["domain from custom script (lite)"]
 
     # Process
     output_rows = []
@@ -373,7 +373,7 @@ def main():
             continue
 
         # Skip if domain already exists in our column (including NOT FOUND)
-        existing_domain = row.get("domain from custom script", "").strip()
+        existing_domain = row.get("domain from custom script (lite)", "").strip()
         if existing_domain:
             print(f"[{i+1}/{len(input_rows)}] Skipping (already processed: {existing_domain})")
             stats["skipped"] += 1
@@ -403,17 +403,17 @@ def main():
             # Add result - just the domain
             domain = result.get("domain")
             if domain:
-                row["domain from custom script"] = domain
+                row["domain from custom script (lite)"] = domain
                 print(f"    ✓ Domain: {domain}")
                 stats["found"] += 1
             else:
-                row["domain from custom script"] = "NOT FOUND"
+                row["domain from custom script (lite)"] = "NOT FOUND"
                 print(f"    ✗ No domain found")
                 stats["not_found"] += 1
 
         except Exception as e:
             print(f"    ERROR: {e}")
-            row["domain from custom script"] = "NOT FOUND"
+            row["domain from custom script (lite)"] = "NOT FOUND"
             stats["not_found"] += 1
 
         output_rows.append(row)
