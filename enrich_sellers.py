@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Amazon Seller Domain Enrichment Script - OPTIMIZED VERSION
+Amazon Seller Domain Enrichment Script
 
-Changes from original:
-- 1 search per company instead of 4 (combined query)
-- Batched Claude calls (5 companies per call instead of 1)
+Features:
+- Dual search engine support (SerpAPI + Google Custom Search)
+- Batched Claude calls (5 companies per call)
+- Automatic resume on interruption
 """
 
 import argparse
@@ -24,6 +25,10 @@ import requests
 
 SERPAPI_KEY = "YOUR_SERPAPI_KEY_HERE"  # Get from https://serpapi.com/manage-api-key
 ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY_HERE"  # Get from https://console.anthropic.com/
+
+# Google Custom Search (100 free/day, then $5/1000 searches)
+GOOGLE_CSE_API_KEY = "YOUR_GOOGLE_CSE_API_KEY_HERE"  # Get from https://console.cloud.google.com/apis/credentials
+GOOGLE_CSE_CX = "YOUR_SEARCH_ENGINE_ID_HERE"  # Get from https://programmablesearchengine.google.com/
 
 SEARCH_DELAY_SECONDS = 1.0
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
@@ -55,6 +60,12 @@ BLACKLIST_PATTERNS = [
     r"\.tumblr\.com$",
     r"^[a-f0-9]{6,}\.myshopify\.com$",
     r"\.godaddysites\.com$",
+    r"(^|\.)amazon\.com$",      # catches us.amazon.com, amazon.com
+    r"(^|\.)amazon\.[a-z]{2,3}$",  # catches amazon.co.uk, amazon.de, etc.
+    r"(^|\.)ubuy\.",            # ubuy.co.in, ubuy.com, etc.
+    r"(^|\.)archive\.",         # archive.org, archive.is, etc.
+    r"(^|\.)alibaba\.com$",     # catches comfier.en.alibaba.com, etc.
+    r"(^|\.)aliexpress\.",      # aliexpress subdomains
 ]
 
 
@@ -71,10 +82,10 @@ def is_blacklisted_domain(domain: str) -> bool:
 
 
 # ============================================================================
-# Google Search
+# Search Engines
 # ============================================================================
 
-def google_search(query: str, num_results: int = 10, max_retries: int = 3) -> list[dict]:
+def serpapi_search(query: str, num_results: int = 10, max_retries: int = 3) -> list[dict]:
     """Search Google using SerpAPI with retry logic for rate limits."""
     params = {
         "engine": "google",
@@ -84,41 +95,93 @@ def google_search(query: str, num_results: int = 10, max_retries: int = 3) -> li
     }
 
     for attempt in range(max_retries):
-        response = requests.get("https://serpapi.com/search", params=params)
+        try:
+            response = requests.get("https://serpapi.com/search", params=params)
 
-        if response.status_code == 429:
-            wait_time = (attempt + 1) * 10  # 10s, 20s, 30s
-            print(f"      Rate limited, waiting {wait_time}s...")
-            time.sleep(wait_time)
-            continue
+            if response.status_code == 429:
+                wait_time = (attempt + 1) * 10  # 10s, 20s, 30s
+                print(f"      [SerpAPI] Rate limited, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
 
-        response.raise_for_status()
-        return response.json().get("organic_results", [])
+            response.raise_for_status()
+            results = response.json().get("organic_results", [])
+            # Tag results with source
+            for r in results:
+                r["_source"] = "serp"
+            return results
+        except Exception as e:
+            print(f"      [SerpAPI] Error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            return []
 
-    # If all retries failed
-    print(f"      Search failed after {max_retries} retries")
+    print(f"      [SerpAPI] Search failed after {max_retries} retries")
     return []
 
 
-def search_for_company(seller_name: str, business_name: str, category: str, subcategory: str) -> list[dict]:
+def google_cse_search(query: str, num_results: int = 10) -> list[dict]:
+    """Search using Google Custom Search API (100 free/day)."""
+    params = {
+        "key": GOOGLE_CSE_API_KEY,
+        "cx": GOOGLE_CSE_CX,
+        "q": query,
+        "num": min(num_results, 10),  # CSE max is 10 per request
+    }
+
+    try:
+        response = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        # Convert to same format as SerpAPI
+        results = []
+        for item in data.get("items", []):
+            results.append({
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+                "_source": "google_cse",
+            })
+        return results
+    except Exception as e:
+        print(f"      [Google CSE] Error: {e}")
+        return []
+
+
+def search_for_company(seller_name: str, business_name: str, category: str, subcategory: str, engine: str = "both") -> list[dict]:
     """
-    Two targeted searches instead of 4.
-    1. Seller/brand name search (priority - 95% of matches come from this)
-    2. Business name search (fallback context)
+    Search for company using specified engine(s).
+
+    engine: "serp", "google", or "both" (default)
     """
     results = []
 
-    # Search 1: Seller/brand name + subcategory (PRIORITY - most domains match the brand)
-    if seller_name:
-        query = f'"{seller_name}" {subcategory} official website'
-        results.extend(google_search(query, 8))
-        time.sleep(SEARCH_DELAY_SECONDS)
+    # Build search queries
+    queries = []
 
-    # Search 2: Business name (fallback - provides context even if different from brand)
-    if business_name and business_name.lower() != seller_name.lower():
-        query = f'"{business_name}" official website'
-        results.extend(google_search(query, 8))
-        time.sleep(SEARCH_DELAY_SECONDS)
+    # Query 1: Simple seller/brand name (catches brand sites with different domain names)
+    if seller_name:
+        queries.append(f'"{seller_name}"')
+
+    # Query 2: Seller/brand name + category (broader context)
+    if seller_name and category:
+        queries.append(f'"{seller_name}" {category}')
+
+    # Query 3: Business name (fallback)
+    if business_name and business_name.lower() != (seller_name or "").lower():
+        queries.append(f'"{business_name}"')
+
+    # Run searches through selected engine(s)
+    for query in queries:
+        if engine in ("serp", "both"):
+            results.extend(serpapi_search(query, 8))
+            time.sleep(SEARCH_DELAY_SECONDS)
+
+        if engine in ("google", "both"):
+            results.extend(google_cse_search(query, 8))
+            time.sleep(SEARCH_DELAY_SECONDS)
 
     return results
 
@@ -135,13 +198,15 @@ def extract_domain(url: str) -> str | None:
 
 
 def filter_results(results: list[dict]) -> list[dict]:
-    """Pre-filter blacklisted domains from results."""
+    """Pre-filter blacklisted domains and dedupe."""
+    seen_domains = set()
     filtered = []
     for r in results:
         domain = extract_domain(r.get("link", ""))
-        if domain and not is_blacklisted_domain(domain):
+        if domain and not is_blacklisted_domain(domain) and domain not in seen_domains:
             r["extracted_domain"] = domain
             filtered.append(r)
+            seen_domains.add(domain)
     return filtered
 
 
@@ -162,7 +227,7 @@ def analyze_batch(client: anthropic.Anthropic, batch: list[dict]) -> list[dict]:
     for i, company in enumerate(batch):
         results_text = json.dumps(
             [{"title": r.get("title"), "domain": r.get("extracted_domain"), "snippet": r.get("snippet")}
-             for r in company["search_results"][:8]],
+             for r in company["search_results"][:12]],
             indent=2
         )
         companies_text += f"""
@@ -180,21 +245,21 @@ Search Results:
 
     prompt = f"""You are finding official website domains for Amazon sellers. I'll give you {len(batch)} companies with their search results.
 
-CRITICAL RULES:
-1. PRIORITIZE domains that match the Seller/Brand Name over the legal Business Name. 95% of the time the domain matches the brand (e.g., seller "Comfier" -> comfier.com, not the legal entity name)
-2. The domain MUST belong to the specific company, not a similarly-named larger company
-3. Be skeptical of generic business names matching Fortune 500 domains
-4. The website should relate to their product category
-5. If not confident (>80%), return null - wrong match is worse than no match
-6. Never return: marketplace sites, placeholder sites (about.me, linktr.ee), news sites
-7. Look for domain mentions in snippets - they often reveal the real website
+RULES:
+1. PRIORITIZE domains that match the Seller/Brand Name over the legal Business Name (e.g., seller "Comfier" -> comfier.com)
+2. The brand name may appear ON the website even if the domain is different (e.g., "Swanoo Store" brand on thestrollerorganizer.com)
+3. Look for the brand name mentioned in page titles or snippets - this often reveals the official site
+4. Be skeptical of generic business names matching Fortune 500 domains
+5. The website should relate to their product category
+6. Never return: marketplace sites (amazon, ebay), placeholder sites (about.me, linktr.ee), news sites
+7. When in doubt, prefer returning a likely match over returning null - we want to find domains
 
 {companies_text}
 
 Respond with ONLY a JSON array of {len(batch)} objects, one per company in order:
 [
-    {{"company": 1, "domain": "example.com" or null, "confidence": "high"|"medium"|"low"|"none"}},
-    {{"company": 2, "domain": "example2.com" or null, "confidence": "high"|"medium"|"low"|"none"}},
+    {{"company": 1, "domain": "example.com" or null}},
+    {{"company": 2, "domain": "example2.com" or null}},
     ...
 ]"""
 
@@ -213,17 +278,12 @@ Respond with ONLY a JSON array of {len(batch)} objects, one per company in order
             response_text = response_text.split("```")[1].split("```")[0]
 
         results = json.loads(response_text)
-
-        # Reject low confidence matches
-        for r in results:
-            if r.get("confidence") == "low":
-                r["domain"] = None
-
         return results
 
     except (json.JSONDecodeError, Exception) as e:
+        print(f"      Claude parse error: {e}")
         # Return empty results for all companies in batch
-        return [{"domain": None, "confidence": "none"} for _ in batch]
+        return [{"domain": None} for _ in batch]
 
 
 # ============================================================================
@@ -231,11 +291,13 @@ Respond with ONLY a JSON array of {len(batch)} objects, one per company in order
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Enrich Amazon seller data with domains (OPTIMIZED)")
-    parser.add_argument("input_csv", help="Path to SmartScout CSV export")
+    parser = argparse.ArgumentParser(description="Enrich Amazon seller data with domains")
+    parser.add_argument("input_csv", help="Path to CSV file")
     parser.add_argument("-o", "--output", help="Output CSV path")
     parser.add_argument("--limit", type=int, help="Limit rows to process")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Companies per Claude call")
+    parser.add_argument("--search-engine", choices=["serp", "google", "both"], default="both",
+                        help="Search engine to use: serp, google, or both (default)")
 
     parser.add_argument("--seller-col", default="Seller", help="Seller name column")
     parser.add_argument("--business-col", default="Business Name", help="Business name column")
@@ -266,7 +328,9 @@ def main():
             print(f"ERROR: Column '{col}' not found. Available: {fieldnames}")
             return 1
 
-    output_fieldnames = list(fieldnames) + ["domain from custom script"]
+    output_fieldnames = list(fieldnames)
+    if "domain from custom script" not in output_fieldnames:
+        output_fieldnames.append("domain from custom script")
 
     # Collect rows to process
     to_process = []
@@ -304,9 +368,15 @@ def main():
             "state": row.get(args.state_col, ""),
         })
 
+    # Calculate search estimates
+    queries_per_company = 2  # seller name, seller + category (roughly)
+    serp_searches = len(to_process) * queries_per_company if args.search_engine in ("serp", "both") else 0
+    google_searches = len(to_process) * queries_per_company if args.search_engine in ("google", "both") else 0
+
     print(f"\nProcessing {len(to_process)} companies in batches of {args.batch_size}...")
-    print(f"Estimated searches: ~{len(to_process) * 2}")
-    print(f"Estimated Claude calls: {(len(to_process) + args.batch_size - 1) // args.batch_size} \n")
+    print(f"Search engine: {args.search_engine}")
+    print(f"Estimated searches: ~{serp_searches + google_searches} (SerpAPI: {serp_searches}, Google CSE: {google_searches})")
+    print(f"Estimated Claude calls: {(len(to_process) + args.batch_size - 1) // args.batch_size}\n")
 
     # Process in batches
     processed_rows = {}
@@ -326,9 +396,15 @@ def main():
                 company['seller_name'],
                 company['business_name'],
                 company['category'],
-                company['subcategory']
+                company['subcategory'],
+                engine=args.search_engine
             )
             company['search_results'] = filter_results(results)
+
+            # Debug: show results by source
+            serp_count = len([r for r in company['search_results'] if r.get('_source') == 'serp'])
+            cse_count = len([r for r in company['search_results'] if r.get('_source') == 'google_cse'])
+            print(f"      Found {len(company['search_results'])} results (SerpAPI: {serp_count}, Google CSE: {cse_count})")
 
         # Analyze batch with Claude
         print(f"    Analyzing batch with Claude...")
@@ -360,7 +436,6 @@ def main():
 
         # Save progress after each batch
         temp_output = []
-        process_indices = {c["index"] for c in to_process}
         for idx, row in enumerate(input_rows):
             if idx in processed_rows:
                 temp_output.append(processed_rows[idx])
@@ -375,7 +450,6 @@ def main():
 
     # Rebuild output_rows in correct order
     final_output = []
-    process_indices = {c["index"] for c in to_process}
 
     for i, row in enumerate(input_rows):
         if i in processed_rows:
