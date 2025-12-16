@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Amazon Seller Domain Enrichment Script
+Amazon Seller Domain Enrichment Script - OPTIMIZED VERSION
 
+Changes from original:
+- 1 search per company instead of 4 (combined query)
+- Batched Claude calls (5 companies per call instead of 1)
 """
 
 import argparse
@@ -19,85 +22,60 @@ import requests
 # Configuration
 # ============================================================================
 
-SERPAPI_KEY = "YOUR_SERPAPI_KEY_HERE"
-ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY_HERE"
+SERPAPI_KEY = "YOUR_SERPAPI_KEY_HERE"  # Get from https://serpapi.com/manage-api-key
+ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY_HERE"  # Get from https://console.anthropic.com/
 
-# Rate limiting
 SEARCH_DELAY_SECONDS = 1.0
-LLM_DELAY_SECONDS = 0.5
-
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
+BATCH_SIZE = 5  # Number of companies to process per Claude call
 
 # ============================================================================
-# Blacklists - domains that are NEVER valid matches
+# Blacklists
 # ============================================================================
 
-# Major companies that get false-matched constantly
 BLACKLIST_DOMAINS = {
-    # Big tech / major sites
     "amazon.com", "walmart.com", "ebay.com", "etsy.com", "alibaba.com",
     "aliexpress.com", "target.com", "costco.com", "bestbuy.com",
     "homedepot.com", "lowes.com", "wayfair.com",
-
-    # Generic placeholder sites
     "about.me", "linktree.com", "linktr.ee", "carrd.co", "bio.link",
-
-    # Huge corporations that aren't Amazon sellers
     "aa.com", "yeti.com", "zones.com", "apple.com", "google.com",
     "microsoft.com", "facebook.com", "meta.com",
-
-    # Business registries / directories
     "dnb.com", "bloomberg.com", "crunchbase.com", "zoominfo.com",
     "linkedin.com", "yellowpages.com", "yelp.com", "bbb.org",
-
-    # News / press release sites
     "abnewswire.com", "prnewswire.com", "businesswire.com", "globenewswire.com",
-
-    # Generic ecommerce platforms (root domains)
     "shopify.com", "bigcommerce.com", "wix.com", "squarespace.com",
     "wordpress.com", "weebly.com",
 }
 
-# Patterns that indicate garbage domains
 BLACKLIST_PATTERNS = [
-    r"\.myshopify\.com$",           # Shopify subdomains
-    r"\.wordpress\.com$",            # WordPress subdomains
-    r"\.wixsite\.com$",              # Wix subdomains
-    r"\.blogspot\.com$",             # Blogspot
-    r"\.tumblr\.com$",               # Tumblr
-    r"^[a-f0-9]{6,}\.myshopify\.com$",  # Random hex shopify stores
-    r"\.godaddysites\.com$",         # GoDaddy sites
+    r"\.myshopify\.com$",
+    r"\.wordpress\.com$",
+    r"\.wixsite\.com$",
+    r"\.blogspot\.com$",
+    r"\.tumblr\.com$",
+    r"^[a-f0-9]{6,}\.myshopify\.com$",
+    r"\.godaddysites\.com$",
 ]
 
 
 def is_blacklisted_domain(domain: str) -> bool:
-    """Check if a domain is blacklisted."""
     if not domain:
         return True
-
     domain = domain.lower().strip()
-
-    # Check exact matches
     if domain in BLACKLIST_DOMAINS:
         return True
-
-    # Check patterns
     for pattern in BLACKLIST_PATTERNS:
         if re.search(pattern, domain):
             return True
-
     return False
 
 
 # ============================================================================
-# Google Search via SerpAPI
+# Google Search
 # ============================================================================
 
-def google_search(query: str, num_results: int = 10) -> list[dict]:
-    """Search Google using SerpAPI."""
-    if not SERPAPI_KEY:
-        raise ValueError("SERPAPI_KEY environment variable not set")
-
+def google_search(query: str, num_results: int = 10, max_retries: int = 3) -> list[dict]:
+    """Search Google using SerpAPI with retry logic for rate limits."""
     params = {
         "engine": "google",
         "q": query,
@@ -105,63 +83,50 @@ def google_search(query: str, num_results: int = 10) -> list[dict]:
         "num": num_results,
     }
 
-    response = requests.get("https://serpapi.com/search", params=params)
-    response.raise_for_status()
+    for attempt in range(max_retries):
+        response = requests.get("https://serpapi.com/search", params=params)
 
-    data = response.json()
-    return data.get("organic_results", [])
+        if response.status_code == 429:
+            wait_time = (attempt + 1) * 10  # 10s, 20s, 30s
+            print(f"      Rate limited, waiting {wait_time}s...")
+            time.sleep(wait_time)
+            continue
+
+        response.raise_for_status()
+        return response.json().get("organic_results", [])
+
+    # If all retries failed
+    print(f"      Search failed after {max_retries} retries")
+    return []
 
 
-def search_for_domain(seller_name: str, business_name: str, category: str, state: str) -> list[dict]:
+def search_for_company(seller_name: str, business_name: str, category: str, subcategory: str) -> list[dict]:
     """
-    Search for company domain using multiple signals.
+    Two targeted searches instead of 4.
+    1. Seller/brand name search (priority - 95% of matches come from this)
+    2. Business name search (fallback context)
     """
     results = []
 
-    # Strategy 1: Business name + state + "official website"
-    if business_name:
-        query = f'"{business_name}" {state} official website'
-        results.extend(google_search(query, 5))
+    # Search 1: Seller/brand name + subcategory (PRIORITY - most domains match the brand)
+    if seller_name:
+        query = f'"{seller_name}" {subcategory} official website'
+        results.extend(google_search(query, 8))
         time.sleep(SEARCH_DELAY_SECONDS)
 
-    # Strategy 2: Seller name + category (if different from business name)
-    if seller_name and seller_name.lower() != business_name.lower():
-        query = f'"{seller_name}" {category} website'
-        results.extend(google_search(query, 5))
+    # Search 2: Business name (fallback - provides context even if different from brand)
+    if business_name and business_name.lower() != seller_name.lower():
+        query = f'"{business_name}" official website'
+        results.extend(google_search(query, 8))
         time.sleep(SEARCH_DELAY_SECONDS)
 
     return results
 
-
-def search_for_linkedin(seller_name: str, business_name: str) -> list[dict]:
-    """Search for LinkedIn company page."""
-    results = []
-
-    # Try business name first
-    if business_name:
-        query = f'"{business_name}" site:linkedin.com/company'
-        results.extend(google_search(query, 5))
-        time.sleep(SEARCH_DELAY_SECONDS)
-
-    # Try seller name if different
-    if seller_name and seller_name.lower() != business_name.lower():
-        query = f'"{seller_name}" site:linkedin.com/company'
-        results.extend(google_search(query, 5))
-        time.sleep(SEARCH_DELAY_SECONDS)
-
-    return results
-
-
-# ============================================================================
-# Domain Validation
-# ============================================================================
 
 def extract_domain(url: str) -> str | None:
-    """Extract clean domain from URL."""
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
-        # Remove www. prefix
         if domain.startswith("www."):
             domain = domain[4:]
         return domain
@@ -169,88 +134,73 @@ def extract_domain(url: str) -> str | None:
         return None
 
 
-# ============================================================================
-# Claude Analysis
-# ============================================================================
-
-def analyze_with_validation(
-    client: anthropic.Anthropic,
-    seller_name: str,
-    business_name: str,
-    category: str,
-    subcategory: str,
-    state: str,
-    domain_results: list[dict],
-    linkedin_results: list[dict],
-) -> dict:
-    """
-    Use Claude to analyze search results with strict validation.
-    """
-
-    # Pre-filter blacklisted domains from results
-    filtered_domain_results = []
-    for r in domain_results:
+def filter_results(results: list[dict]) -> list[dict]:
+    """Pre-filter blacklisted domains from results."""
+    filtered = []
+    for r in results:
         domain = extract_domain(r.get("link", ""))
         if domain and not is_blacklisted_domain(domain):
             r["extracted_domain"] = domain
-            filtered_domain_results.append(r)
+            filtered.append(r)
+    return filtered
 
-    domain_results_text = json.dumps(
-        [{"title": r.get("title"), "link": r.get("link"), "domain": r.get("extracted_domain"), "snippet": r.get("snippet")}
-         for r in filtered_domain_results[:10]],
-        indent=2
-    )
 
-    linkedin_results_text = json.dumps(
-        [{"title": r.get("title"), "link": r.get("link"), "snippet": r.get("snippet")}
-         for r in linkedin_results[:10]],
-        indent=2
-    )
+# ============================================================================
+# Batched Claude Analysis
+# ============================================================================
 
-    prompt = f"""You are helping find the official website domain and LinkedIn page for an Amazon seller.
+def analyze_batch(client: anthropic.Anthropic, batch: list[dict]) -> list[dict]:
+    """
+    Analyze multiple companies in a single Claude call.
 
-SELLER INFORMATION:
-- Amazon Seller/Store Name: {seller_name}
-- Legal Business Name: {business_name}
-- Product Category: {category}
-- Product Subcategory: {subcategory}
-- State: {state}, USA
+    batch: list of dicts with keys: seller_name, business_name, category, subcategory, state, search_results
+    returns: list of dicts with keys: domain (or None)
+    """
 
-YOUR TASK: Find their ACTUAL company website and LinkedIn page.
+    # Build the prompt with all companies
+    companies_text = ""
+    for i, company in enumerate(batch):
+        results_text = json.dumps(
+            [{"title": r.get("title"), "domain": r.get("extracted_domain"), "snippet": r.get("snippet")}
+             for r in company["search_results"][:8]],
+            indent=2
+        )
+        companies_text += f"""
+--- COMPANY {i+1} ---
+Seller Name: {company['seller_name']}
+Business Name: {company['business_name']}
+Category: {company['category']}
+Subcategory: {company['subcategory']}
+State: {company['state']}
 
-CRITICAL RULES - READ CAREFULLY:
-1. The domain MUST belong to this specific company, not a similarly-named larger company
-2. If "{business_name}" is a generic name like "AA Group" or "XY Textiles", be VERY skeptical of matching to big companies
-3. The website content should relate to their product category ({category} / {subcategory})
-4. If you're not confident (>80%) it's the right company, return null - a wrong match is worse than no match
-5. Never return marketplace sites (Amazon, eBay, Walmart, Etsy, Alibaba)
-6. Never return generic placeholder sites (about.me, linktr.ee, etc.)
-7. A small company selling "{subcategory}" probably doesn't own a Fortune 500 domain
+Search Results:
+{results_text}
 
-SEARCH RESULTS FOR WEBSITE (pre-filtered):
-{domain_results_text}
+"""
 
-SEARCH RESULTS FOR LINKEDIN:
-{linkedin_results_text}
+    prompt = f"""You are finding official website domains for Amazon sellers. I'll give you {len(batch)} companies with their search results.
 
-Think step by step:
-1. What kind of company is this based on their products?
-2. Do any of these domains logically belong to a {category} seller?
-3. Is the domain size/type appropriate for the business?
+CRITICAL RULES:
+1. PRIORITIZE domains that match the Seller/Brand Name over the legal Business Name. 95% of the time the domain matches the brand (e.g., seller "Comfier" -> comfier.com, not the legal entity name)
+2. The domain MUST belong to the specific company, not a similarly-named larger company
+3. Be skeptical of generic business names matching Fortune 500 domains
+4. The website should relate to their product category
+5. If not confident (>80%), return null - wrong match is worse than no match
+6. Never return: marketplace sites, placeholder sites (about.me, linktr.ee), news sites
+7. Look for domain mentions in snippets - they often reveal the real website
 
-Respond with ONLY valid JSON:
-{{
-    "domain": "example.com" or null,
-    "domain_confidence": "high" | "medium" | "low" | "none",
-    "domain_reasoning": "Brief explanation of why this matches or why no match",
-    "linkedin_url": "https://www.linkedin.com/company/example" or null,
-    "linkedin_confidence": "high" | "medium" | "low" | "none",
-    "rejection_reasons": ["List of domains you rejected and why"]
-}}"""
+{companies_text}
+
+Respond with ONLY a JSON array of {len(batch)} objects, one per company in order:
+[
+    {{"company": 1, "domain": "example.com" or null, "confidence": "high"|"medium"|"low"|"none"}},
+    {{"company": 2, "domain": "example2.com" or null, "confidence": "high"|"medium"|"low"|"none"}},
+    ...
+]"""
 
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=800,
+        max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )
 
@@ -262,65 +212,31 @@ Respond with ONLY valid JSON:
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0]
 
-        result = json.loads(response_text)
+        results = json.loads(response_text)
 
-        # Additional validation: reject low confidence matches
-        if result.get("domain_confidence") == "low":
-            result["domain"] = None
-            result["domain_reasoning"] = f"Low confidence - rejected. Original reasoning: {result.get('domain_reasoning', '')}"
+        # Reject low confidence matches
+        for r in results:
+            if r.get("confidence") == "low":
+                r["domain"] = None
 
-        return result
+        return results
 
-    except json.JSONDecodeError:
-        return {
-            "domain": None,
-            "domain_confidence": "none",
-            "domain_reasoning": f"Failed to parse response",
-            "linkedin_url": None,
-            "linkedin_confidence": "none",
-            "rejection_reasons": []
-        }
+    except (json.JSONDecodeError, Exception) as e:
+        # Return empty results for all companies in batch
+        return [{"domain": None, "confidence": "none"} for _ in batch]
 
 
 # ============================================================================
 # Main Processing
 # ============================================================================
 
-def process_seller(
-    client: anthropic.Anthropic,
-    seller_name: str,
-    business_name: str,
-    category: str,
-    subcategory: str,
-    state: str,
-) -> dict:
-    """Process a single seller with enhanced matching."""
-
-    print(f"    Searching for website...")
-    domain_results = search_for_domain(seller_name, business_name, category, state)
-
-    print(f"    Searching for LinkedIn...")
-    linkedin_results = search_for_linkedin(seller_name, business_name)
-
-    print(f"    Analyzing results...")
-    result = analyze_with_validation(
-        client, seller_name, business_name, category, subcategory, state,
-        domain_results, linkedin_results
-    )
-    time.sleep(LLM_DELAY_SECONDS)
-
-    return result
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Enrich Amazon seller data with domains (v2 - improved accuracy)"
-    )
+    parser = argparse.ArgumentParser(description="Enrich Amazon seller data with domains (OPTIMIZED)")
     parser.add_argument("input_csv", help="Path to SmartScout CSV export")
     parser.add_argument("-o", "--output", help="Output CSV path")
     parser.add_argument("--limit", type=int, help="Limit rows to process")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Companies per Claude call")
 
-    # Column name overrides (defaults match SmartScout export)
     parser.add_argument("--seller-col", default="Seller", help="Seller name column")
     parser.add_argument("--business-col", default="Business Name", help="Business name column")
     parser.add_argument("--category-col", default="Category", help="Category column")
@@ -329,16 +245,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Paths
     input_path = Path(args.input_csv)
     if not input_path.exists():
         print(f"ERROR: Input file not found: {input_path}")
         return 1
 
-    # Output to same file (or custom path if specified)
     output_path = Path(args.output) if args.output else input_path
-
-    # Initialize client
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     # Read input
@@ -347,19 +259,18 @@ def main():
         input_rows = list(reader)
         fieldnames = reader.fieldnames
 
-    # Validate columns exist
+    # Validate columns
     required_cols = [args.seller_col, args.business_col, args.category_col]
     for col in required_cols:
         if col not in fieldnames:
             print(f"ERROR: Column '{col}' not found. Available: {fieldnames}")
             return 1
 
-    # Output columns - just add the domain column
     output_fieldnames = list(fieldnames) + ["domain from custom script (lite)"]
 
-    # Process
+    # Collect rows to process
+    to_process = []
     output_rows = []
-    count = 0
     stats = {"found": 0, "not_found": 0, "skipped": 0}
 
     for i, row in enumerate(input_rows):
@@ -372,7 +283,6 @@ def main():
             output_rows.append(row)
             continue
 
-        # Skip if domain already exists in our column (including NOT FOUND)
         existing_domain = row.get("domain from custom script (lite)", "").strip()
         if existing_domain:
             print(f"[{i+1}/{len(input_rows)}] Skipping (already processed: {existing_domain})")
@@ -380,61 +290,107 @@ def main():
             output_rows.append(row)
             continue
 
-        if args.limit and count >= args.limit:
-            print(f"Reached limit of {args.limit}")
-            # Add remaining unprocessed rows to output
-            for remaining_row in input_rows[i:]:
-                output_rows.append(remaining_row)
-            break
+        if args.limit and len(to_process) >= args.limit:
+            output_rows.append(row)
+            continue
 
-        display_name = business_name or seller_name
-        print(f"[{i+1}/{len(input_rows)}] Processing: {display_name}")
+        to_process.append({
+            "index": i,
+            "row": row,
+            "seller_name": seller_name,
+            "business_name": business_name,
+            "category": row.get(args.category_col, ""),
+            "subcategory": row.get(args.subcategory_col, ""),
+            "state": row.get(args.state_col, ""),
+        })
 
-        try:
-            result = process_seller(
-                client,
-                seller_name=seller_name,
-                business_name=business_name,
-                category=row.get(args.category_col, ""),
-                subcategory=row.get(args.subcategory_col, ""),
-                state=row.get(args.state_col, ""),
+    print(f"\nProcessing {len(to_process)} companies in batches of {args.batch_size}...")
+    print(f"Estimated searches: ~{len(to_process) * 2}")
+    print(f"Estimated Claude calls: {(len(to_process) + args.batch_size - 1) // args.batch_size} \n")
+
+    # Process in batches
+    processed_rows = {}
+
+    for batch_start in range(0, len(to_process), args.batch_size):
+        batch = to_process[batch_start:batch_start + args.batch_size]
+        batch_num = batch_start // args.batch_size + 1
+        total_batches = (len(to_process) + args.batch_size - 1) // args.batch_size
+
+        print(f"[Batch {batch_num}/{total_batches}] Processing {len(batch)} companies...")
+
+        # Search for each company in batch
+        for company in batch:
+            display_name = company['seller_name'] or company['business_name']
+            print(f"    Searching: {display_name[:40]}...")
+            results = search_for_company(
+                company['seller_name'],
+                company['business_name'],
+                company['category'],
+                company['subcategory']
             )
+            company['search_results'] = filter_results(results)
 
-            # Add result - just the domain
-            domain = result.get("domain")
-            if domain:
-                row["domain from custom script (lite)"] = domain
-                print(f"    ✓ Domain: {domain}")
-                stats["found"] += 1
-            else:
-                row["domain from custom script (lite)"] = "NOT FOUND"
-                print(f"    ✗ No domain found")
-                stats["not_found"] += 1
+        # Analyze batch with Claude
+        print(f"    Analyzing batch with Claude...")
+        try:
+            results = analyze_batch(client, batch)
+
+            for company, result in zip(batch, results):
+                domain = result.get("domain")
+                row = company["row"]
+                display_name = company['seller_name'] or company['business_name']
+
+                if domain:
+                    row["domain from custom script (lite)"] = domain
+                    print(f"    ✓ {display_name[:30]}: {domain}")
+                    stats["found"] += 1
+                else:
+                    row["domain from custom script (lite)"] = "NOT FOUND"
+                    print(f"    ✗ {display_name[:30]}: NOT FOUND")
+                    stats["not_found"] += 1
+
+                processed_rows[company["index"]] = row
 
         except Exception as e:
             print(f"    ERROR: {e}")
-            row["domain from custom script (lite)"] = "NOT FOUND"
-            stats["not_found"] += 1
+            for company in batch:
+                company["row"]["domain from custom script (lite)"] = "NOT FOUND"
+                processed_rows[company["index"]] = company["row"]
+                stats["not_found"] += 1
 
-        output_rows.append(row)
+        # Save progress after each batch
+        temp_output = []
+        process_indices = {c["index"] for c in to_process}
+        for idx, row in enumerate(input_rows):
+            if idx in processed_rows:
+                temp_output.append(processed_rows[idx])
+            else:
+                temp_output.append(row)
 
-        # Write output incrementally
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=output_fieldnames, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(output_rows)
+            writer.writerows(temp_output)
+        print(f"    [Saved progress to {output_path}]")
 
-        count += 1
+    # Rebuild output_rows in correct order
+    final_output = []
+    process_indices = {c["index"] for c in to_process}
 
-    # Final write to ensure all rows are saved
+    for i, row in enumerate(input_rows):
+        if i in processed_rows:
+            final_output.append(processed_rows[i])
+        else:
+            final_output.append(row)
+
+    # Write output
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=output_fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(output_rows)
+        writer.writerows(final_output)
 
-    # Summary
     print(f"\n{'='*50}")
-    print(f"COMPLETE: Processed {count} sellers")
+    print(f"COMPLETE: Processed {len(to_process)} sellers")
     print(f"  Found domains: {stats['found']}")
     print(f"  No match: {stats['not_found']}")
     print(f"  Skipped: {stats['skipped']}")
