@@ -5,7 +5,7 @@ Amazon Seller Domain Enrichment Script
 Features:
 - Dual search engine support (SerpAPI + Google Custom Search)
 - Batched Claude calls (5 companies per call)
-- Automatic resume on interruption
+- Automatic resume on interruptions
 """
 
 import argparse
